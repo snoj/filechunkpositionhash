@@ -10,8 +10,9 @@ var mod = module.exports = function() {};
 console.passthru = function(method) {
   return function() {
     var args = Array.prototype.slice.call(arguments, 0);
+    console.log("passthru args", args);
     console[method].apply(console, args);
-    if(args.length == 1)
+    if((args.length || 0) == 1)
       return args[0];
     return args;
   };
@@ -26,10 +27,10 @@ mod.send = function(msg, port, address, cb) {
     c.close();
   });
 };
-function hashthing(content, algo) {
+function hashthing(content, algo, outformat) {
   var hashc = crypto.createHash(algo || 'sha256');
   return xThing(hashc,content).then(function(hashed) {
-    return hashed.toString('hex');
+    return hashed.toString(outformat || 'hex');
   });
 };
 
@@ -61,73 +62,116 @@ function decryptThing(key, buf) {
   decipher.setAutoPadding(true);
   return xThing(decipher, buf);
 }
-
-function hashlist(filename, enckey, idContent, opts) {
-  opts || (opts = {});
-
-  opts = _.defaults(opts, {
-    tryLocalFile: false,
-    skipFileRead: false,
-    size: -1
+function hashlist(uopts) {
+  var opts = _.defaults(uopts, {
+    realfilename: "",
+    relfilename: "",
+    cipherkey: "",
+    addOffsetHashContent: [],
+    size: -1,
+    chunkSize: 1024*128, //128KB
+    ignoreMissing: true, //if true, size needs to be set too or errors out
+    onlyOffsetHashes: false, // will only calculate offset hashs. forces skipFileRead = true
+    skipFileRead: false, //forces skipContentHash & skipEncHash=true
+    skipContent: false, //won't return encrypted chunks, will still read the file
+    skipContentHash: false, //won't return hashs for pre-encrypted data
+    skipEncHash: false //won't return hashs on encrypted data
   });
 
-  return new Promise(function(resolve, reject) {
-    var rf = fs.readFile;
 
-    if(!!opts.skipFileRead)
-      rf = function(fn, cb) {
-        cb(null, new Buffer());
-      };
-    fs.readFile(filename, function(err, data) {
+  var fSize = opts.size;
+  var noContent = false;
 
-      var ignoreMissingFile = opts.skipFileRead || opts.tryLocalFile;
-      //if(!!err)
-      //  return reject(err);
-      var fileSize = data && !!!err ? data.length : opts.size;
+  return new Promise(function haslistPromise(resolve, reject) {
+    var obj = {
+      filename: opts.relfilename,
+      size: -1,
+      chunks: []
+    };
 
-      if(fileSize == 0 && !!!err && !ignoreMissingFile)
-        return resolve([]);
+    var readFile = fs.readFile;
+    switch(true) {
+      case opts.onlyOffsetHashes:
+      case opts.skipFileRead:
+        opts.skipContentHash = true;
+        opts.skipEncHash = true;
+        readFile = function(file, cb) {
+          noContent = true;
+          cb(null, new Buffer([]));
+        };
+        break;
+    }
+    var fileRawContent = new Promise(function(resolve, reject) {
+      readFile(opts.realfilename, function (err, data) {
+        if(!!err && !!opts.ignoreMissing && fSize > -1) {
+          return resolve([]);
+        } else if(!!err) {
+          return reject(err);
+        }
+        fSize = data.length;
+        resolve(data);
+      });
+    }).catch(reject);
 
-      if(fileSize < 0)
-        reject("Invalid filesize");
+    var chunks = fileRawContent.then(function(fbuf) {
+      return new Promise(function hashlistChunkSplitter(resolve, reject) {
+        var chunksPromises = []
+        for(var i = 0; i < fSize; i += opts.chunkSize) {
+          var offestHash = Promise.resolve(""),
+            rawHash = Promise.resolve(""),
+            ciphered = Promise.resolve(""),
+            cipheredHash = Promise.resolve();
 
-      var chunks = [];
-      if(!!err)
-        return reject(err);
-      var r = [];
-      var chunkSize = 1024*128; //128KB;
+          offsetHash = hashthing([opts.relfilename, i, opts.cipherkey, ].concat(opts.addOffsetHashContent).join('-'));
 
-      for(var i = 0; i < fileSize; i += chunkSize) {
-        var id = [i].concat(idContent).join("-");
-        var encrypted = (ignoreMissingFile && !err) ? Promise.resolve("") : encryptThing(enckey, data.slice(i, i+chunkSize));
+          if(!opts.onlyOffsetHashes && !noContent) {
+            var fbufchunk = fbuf.slice(i, i+opts.chunkSize);
+            if(!opts.skipContentHash)
+              contenthash = hashthing(fbufchunk);
 
-        var encryptedHash = (ignoreMissingFile && !err) ? hashthing([i,enckey,i,Date.now()].join("")) : encrypted.then(function(buff) {
-          return hashthing(buff);
-        });
+            if(!opts.skipContent)
+              ciphered = encryptThing(opts.cipherkey, fbufchunk);
 
-        chunks.push(Promise.all([
-          hashthing(id),
-          encrypted,
-          encryptedHash,
-          Promise.resolve(i) //start offset
-        ]));
-      }
+            if(!opts.skipEncHash)
+              cipheredHash = ciphered.then(function(ch) {
+                return hashthing(ch);
+              });
+          }
 
-      Promise.all(chunks).then(function(cs) {
-        return _.map(cs, function(p) {
-          return {
-            id: p[0],
-            content: p[1],
-            hash: p[2],
-            start: p[3]
-          };
-        });
-      }).then(resolve).catch(reject);
-    });
-  });
-};
+          chunksPromises.push(Promise.all([
+            Promise.resolve(i),
+            offsetHash,
+            contenthash,
+            ciphered,
+            cipheredHash
+          ]));
+        }
+        Promise.all(chunksPromises).then(function hashlistChunkMapper(chunksInfo) {
+          resolve(_.map(chunksInfo, function(i) {
+            return {
+              o: i[0],
+              ohash: i[1],
+              rhash: i[2],
+              c: i[3],
+              chash: i[4]
+            };
+          }));
+        }).catch(reject);
+      });
+    }); //end chunks
+    chunks.then(function hashlistChunkMeta(chunksInfo) {
+      resolve({
+        filename: opts.relfilename,
+        size: fSize,
+        id: "",
+        lastmod: 0,
+        chunks: chunksInfo
+      });
+    }).catch(reject);
+  });//end main Promise
+} //end hashlist
 
-var client = function(dir, id, encryptkey) {
+var client = function Client(dir, id, encryptkey) {
   var self = this;
   self.dir = dir;
   self.id = id;
@@ -189,36 +233,8 @@ var client = function(dir, id, encryptkey) {
     }
   });
 
-  //toss this? meaningless
-  self.on('file:sync', function(chunksPromise) {
-    chunksPromise.then(function(chunks) {
-      var f = function(c, msg) {
-        //this will stick around if no peers have the piece
-        //will need a way to cleanup old event stuff.
-        if(!!msg.err)
-          self.once('file:sync:'+c.id, f.bind(null, c));
-        var c = _.find(chunks, ['id', msg.id]);
-        c.content = msg.content;
-        //stream to file;
-      };
-
-      _.each(chunks, function(c) {
-        //need delay
-        self.once('file:sync:'+c.id, f.bind(null, c));
-        _.each(self._neighbors, function(n) {
-          //ask for parts
-          n.send({
-            type: 'piece:request',
-            id: c.id,
-            //encrypted hint for trusted peers?
-          });
-        });
-      });
-    });
-  });
-
-  self.on('file:remotechange', function(file) {
-    decryptThing(self._encryptKey, new Buffer(file.meta, 'base64')).then(function(data) {
+  self.on('file:remotechange', function(msg) {
+    decryptThing(self._encryptKey, new Buffer(msg.meta, 'base64')).then(function(data) {
       try {
         var o = JSON.parse(data.toString('utf8'));
         //o.filename
@@ -228,23 +244,30 @@ var client = function(dir, id, encryptkey) {
         //o.chunks
           //o.chunks[].id
           //o.chunks[].hash
-        var chunks = hashlist(o.filename, self._encryptKey, [o.filename, self._encryptKey], {tryLocalFile: true, size: o.size});
-        chunks.then(function(chunks) {
-          var rawdiff = _.uniqBy(_.xorBy(chunks, o.chunks, function(x) { return x.id + x.hash; }), 'id');
-          //req differences.
-          var realdiff = _.map(rawdiff, function(d) {
-            var remotedets = _.find(o.chunks, ['id', d.id]);
-            var localdets = _.find(chunks, ['id', d.id]);
+        var chunks = hashlist({
+          filename: o.filename,
+          cipherkey: self._encryptKey,
+          size: o.size,
+        });
+        chunks.then(function(info) {
+          var diff1 = _.uniqBy(_.xorBy(info.chunks, o.chunks, function(x) {
+            return x.ohash + ohash;
+          }), 'ohash');
+          var fdiff = _.map(diff1, function(d) {
+            var remotedets = _.find(o.chunks, ['ohash', d.ohash]);
+            var localdets = _.find(d.chunks, ['ohash', d.ohash]);
             return _.defaults(remotedets, localdets);
           });
-          var fn = self.dir+'/'+o.filename;
-          fs.open(fn, 'a', function(err, fh) {
-            _.each(realdiff, function(chunk) {
+
+          var realfilename = self.dir + '/' + o.filename;
+
+          fs.open(realfilename, function(err, fh) {
+            _.each(fdiff, function(chunk) {
               self.requestPiece(fh, chunk);
-              //fileHandle, chuckInfo, peerHint
             });
           });
         });
+
       } catch(ex) { }
     }).catch(console.error.bind("file:remotechange decryption error"));
   });
@@ -259,7 +282,7 @@ client.prototype._fschange = function(eventType, filename) {
 
   this.emit('filewatch', eventType, filename);
 
-  hashlist(this.dir + '/' + filename, this._encryptKey, [filename, this._encryptKey]).then(this.emit.bind(this, 'encryptedChunks'));
+  //hashlist(this.dir + '/' + filename, this._encryptKey, [filename, this._encryptKey]).then(this.emit.bind(this, 'encryptedChunks'));
 };
 
 client.prototype.sorted = function(o) {
@@ -328,6 +351,64 @@ client.prototype.connectTo = function(address,port) {
     type: 'iam',
     iam: selfid
   }), 'utf8'), realport, realaddress);
+};
+
+client.prototype._genMeta = function(filepath) {
+  var meta = {
+    file: filepath,
+  };
+  return hashlist({
+    realfilename: this.dir + '/' + filepath,
+    filename: filename,
+    cipherkey: this._encryptKey,
+    onlyOffsetHashes: true
+  });
+  //return hashlist(filepath, this._encryptKey, )
+};
+client.prototype.pushFileUpdate = function(file, chunks) {
+  var self=  this;
+  //o.filename
+  //o.id
+  //o.size
+  //o.lastmod
+  //o.chunks
+    //o.chunks[].id
+    //o.chunks[].hash
+  //(filename, enckey, idContent, opts)
+  return new Promise(function(resolve, reject) {
+    var realpath = self.dir + "/" + file;
+    fs.stat(realpath, function(err, stats) {
+      var hlopts = {
+        realfilename: realpath,
+        file: file,
+        cipherkey: self.encryptkey
+      };
+      //console.log("asdfasdf")
+      hashlist(hlopts).then(function(meta) {
+        console.log(meta);
+      }).then(resolve).catch(reject);
+    });
+  });
+  /*
+  fs.stat(file, function(err, stats) {
+    hashlist(file, this._encryptKey,  [file, this._encryptKey], {noContent: true}).then(function(chunks) {
+      var meta = {
+        filename: file,
+        id: "",
+        size: stats.size, //need to get file size  somehow
+        lastmod: 0,
+        chunks: chunks
+      };
+      encryptThing(self._encryptKey, new Buffer(JSON.stringify(meta), 'base64')).then(function(enmeta) {
+        var msg = {
+          type: 'file:remotechange'
+          meta: enmeta
+        };
+        //send to peers
+      })
+    });
+  });
+  */
 };
 
 
